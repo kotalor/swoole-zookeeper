@@ -1,0 +1,43 @@
+{
+    "name": "swoole/zookeeper",
+    "description": "Pure PHP Zookeeper client based on Swoole coroutine, compatible with PHP Zookeeper extension API",
+    "type": "library",
+    "keywords": [
+        "zookeeper",
+        "swoole",
+        "coroutine",
+        "distributed",
+        "coordination",
+        "service-discovery"
+    ],
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "kotalor",
+            "email": "kotalor@gmail.com"
+        }
+    ],
+    "require": {
+        "php": ">=8.0",
+        "ext-swoole": ">=5.1"
+    },
+    "require-dev": {
+        "swoole/ide-helper": "5.1.7"
+    },
+    "autoload": {
+        "psr-4": {
+            "Swoole\\Zookeeper\\": "src/"
+        },
+        "files": [
+            "src/functions.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Swoole\\Zookeeper\\Tests\\": "tests/"
+        }
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
+
