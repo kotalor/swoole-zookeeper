@@ -1,5 +1,5 @@
 {
-    "name": "swoole/zookeeper",
+    "name": "kotalor/swoole-zookeeper",
     "description": "Pure PHP Zookeeper client based on Swoole coroutine, compatible with PHP Zookeeper extension API",
     "type": "library",
     "keywords": [

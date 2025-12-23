@@ -20,7 +20,7 @@
 ## 安装
 
 ```bash
-composer require swoole/zookeeper
+composer require kotalor/swoole-zookeeper
 ```
 
 ## 快速开始
