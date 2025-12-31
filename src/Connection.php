@@ -478,6 +478,18 @@ class Connection
     {
         $this->running = false;
         
+        // 取消心跳协程（如果正在 sleep 中）
+        if ($this->pingCoroutineId !== null) {
+            Coroutine::cancel($this->pingCoroutineId);
+            $this->pingCoroutineId = null;
+        }
+        
+        // 取消接收协程
+        if ($this->recvCoroutineId !== null) {
+            Coroutine::cancel($this->recvCoroutineId);
+            $this->recvCoroutineId = null;
+        }
+        
         if ($this->state === State::CONNECTED && $this->client && $this->client->connected) {
             try {
                 $request = new CloseRequest();
