@@ -114,25 +114,31 @@ class Zookeeper
     private ?Connection $connection = null;
     /** @var callable|null */
     private mixed $defaultWatcher = null;
-    private int $timeout;
+    /** 会话超时(毫秒)，与服务端协商的session timeout，决定心跳与重连窗口 */
+    private int $sessionTimeout;
+    /** 操作超时(毫秒)，单次请求等待响应/TCP连接的超时 */
+    private int $operationTimeout;
     
     /**
      * 创建Zookeeper客户端
      *
      * @param string $host 服务器地址，格式: host1:port1,host2:port2
      * @param callable|null $watcher_cb 默认watcher回调
-     * @param int $recv_timeout 超时时间(毫秒)
+     * @param int $recv_timeout 会话超时(毫秒)，与PHP Zookeeper扩展语义一致
+     * @param int|null $operation_timeout 操作超时(毫秒)，为null时沿用$recv_timeout以兼容旧行为
      */
     public function __construct(
         string $host = '',
         ?callable $watcher_cb = null,
-        int $recv_timeout = 10000
+        int $recv_timeout = 10000,
+        ?int $operation_timeout = null
     ) {
-        $this->timeout = $recv_timeout;
+        $this->sessionTimeout = $recv_timeout;
+        $this->operationTimeout = $operation_timeout ?? $recv_timeout;
         $this->defaultWatcher = $watcher_cb;
         
         if ($host !== '') {
-            $this->connect($host, $watcher_cb, $recv_timeout);
+            $this->connect($host, $watcher_cb, $recv_timeout, $operation_timeout);
         }
     }
     
@@ -141,21 +147,24 @@ class Zookeeper
      *
      * @param string $host 服务器地址
      * @param callable|null $watcher_cb 默认watcher回调
-     * @param int $recv_timeout 超时时间(毫秒)
+     * @param int $recv_timeout 会话超时(毫秒)
+     * @param int|null $operation_timeout 操作超时(毫秒)，为null时沿用$recv_timeout
      */
     public function connect(
         string $host,
         ?callable $watcher_cb = null,
-        int $recv_timeout = 10000
+        int $recv_timeout = 10000,
+        ?int $operation_timeout = null
     ): void {
         if ($this->connection !== null) {
             $this->close();
         }
         
-        $this->timeout = $recv_timeout;
+        $this->sessionTimeout = $recv_timeout;
+        $this->operationTimeout = $operation_timeout ?? $recv_timeout;
         $this->defaultWatcher = $watcher_cb ?? $this->defaultWatcher;
         
-        $this->connection = new Connection($host, $recv_timeout);
+        $this->connection = new Connection($host, $this->operationTimeout, $this->sessionTimeout);
         
         if ($this->defaultWatcher) {
             $this->connection->setDefaultWatcher($this->defaultWatcher);
@@ -482,7 +491,8 @@ class Zookeeper
         $this->ensureConnected();
         
         $request = new AuthRequest(0, $scheme, $cert);
-        $xid = $this->connection->getNextXid();
+        // 认证包必须使用固定的特殊xid(-4)，服务端的认证响应也会用-4回送
+        $xid = Connection::AUTH_XID;
         $data = $request->pack($xid);
         
         $result = $this->connection->sendRequest($data, OpCode::AUTH, $xid);
@@ -539,16 +549,46 @@ class Zookeeper
     }
     
     /**
-     * 获取接收超时时间
+     * 获取接收超时时间（会话超时）
+     *
+     * 与PHP Zookeeper扩展一致：返回与服务端协商后的session timeout。
      *
      * @return int 超时时间(毫秒)
      */
     public function getRecvTimeout(): int
     {
         if ($this->connection === null) {
-            return $this->timeout;
+            return $this->sessionTimeout;
         }
         return $this->connection->getTimeout();
+    }
+    
+    /**
+     * 获取操作超时时间(毫秒)
+     *
+     * 单次请求等待响应/TCP连接的超时，独立于会话超时。
+     *
+     * @return int 超时时间(毫秒)
+     */
+    public function getOperationTimeout(): int
+    {
+        if ($this->connection === null) {
+            return $this->operationTimeout;
+        }
+        return $this->connection->getOperationTimeout();
+    }
+    
+    /**
+     * 设置操作超时时间(毫秒)
+     *
+     * @param int $milliseconds 操作超时(毫秒)
+     */
+    public function setOperationTimeout(int $milliseconds): void
+    {
+        $this->operationTimeout = $milliseconds;
+        if ($this->connection !== null) {
+            $this->connection->setOperationTimeout($milliseconds);
+        }
     }
     
     /**

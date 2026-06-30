@@ -13,6 +13,7 @@ use Swoole\Zookeeper\Protocol\State;
 use Swoole\Zookeeper\Protocol\Request\ConnectRequest;
 use Swoole\Zookeeper\Protocol\Request\PingRequest;
 use Swoole\Zookeeper\Protocol\Request\CloseRequest;
+use Swoole\Zookeeper\Protocol\Request\SetWatchesRequest;
 use Swoole\Zookeeper\Protocol\Response\ConnectResponse;
 use Swoole\Zookeeper\Protocol\Response\ReplyHeader;
 use Swoole\Zookeeper\Protocol\Response\WatcherEvent;
@@ -25,6 +26,12 @@ use Swoole\Zookeeper\Exception\SessionExpiredException;
  */
 class Connection
 {
+    // 协议中固定含义的特殊xid
+    public const NOTIFICATION_XID = -1;
+    public const PING_XID = -2;
+    public const AUTH_XID = -4;
+    public const SET_WATCHES_XID = -8;
+
     private ?Client $client = null;
     private Buffer $recvBuffer;
     private int $state = State::NOT_CONNECTED;
@@ -34,6 +41,7 @@ class Connection
     private string $sessionPassword = '';
     private int $sessionTimeout = 30000;
     private int $negotiatedTimeout = 0;
+    private int $lastZxid = 0;
     
     // 请求管理
     private int $xid = 0;
@@ -48,19 +56,29 @@ class Connection
     // 协程和通道
     private ?int $recvCoroutineId = null;
     private ?int $pingCoroutineId = null;
+    private ?int $reconnectCoroutineId = null;
     private bool $running = false;
+    private bool $reconnecting = false;
+    // 连接代次，用于让旧的接收协程在重连后自动退出
+    private int $generation = 0;
     
     // 服务器列表
     private array $servers = [];
     private int $serverIndex = 0;
     
+    /**
+     * @param string $hosts            服务器列表 host1:port1,host2:port2
+     * @param int    $operationTimeout 操作超时(毫秒)：TCP连接、等待单次请求响应
+     * @param int    $sessionTimeout   会话超时(毫秒)：与服务端协商的session timeout，决定心跳间隔与重连窗口
+     */
     public function __construct(
         private string $hosts,
-        private int $timeout = 30000
+        private int $operationTimeout = 30000,
+        int $sessionTimeout = 30000
     ) {
         $this->recvBuffer = new Buffer();
         $this->parseHosts($hosts);
-        $this->sessionTimeout = $timeout;
+        $this->sessionTimeout = $sessionTimeout;
     }
     
     /**
@@ -110,6 +128,7 @@ class Connection
         }
         
         $this->state = State::CONNECTING;
+        $this->running = true;
         
         $connected = false;
         $lastError = null;
@@ -119,18 +138,7 @@ class Connection
             $server = $this->getNextServer();
             
             try {
-                $this->client = new Client(SWOOLE_SOCK_TCP);
-                $this->client->set([
-                    'open_length_check' => true,
-                    'package_length_type' => 'N',
-                    'package_length_offset' => 0,
-                    'package_body_offset' => 4,
-                    'package_max_length' => 1024 * 1024,
-                ]);
-                
-                if (!$this->client->connect($server['host'], $server['port'], $this->timeout / 1000)) {
-                    throw new ConnectionLossException("Failed to connect to {$server['host']}:{$server['port']}");
-                }
+                $this->openSocket($server);
                 
                 // 发送连接请求
                 $this->sendConnectRequest();
@@ -138,12 +146,16 @@ class Connection
                 break;
             } catch (\Throwable $e) {
                 $lastError = $e;
-                $this->client = null;
+                if ($this->client) {
+                    $this->client->close();
+                    $this->client = null;
+                }
             }
         }
         
         if (!$connected) {
             $this->state = State::NOT_CONNECTED;
+            $this->running = false;
             throw $lastError ?? new ConnectionLossException('Failed to connect to any server');
         }
         
@@ -155,13 +167,32 @@ class Connection
     }
     
     /**
+     * 建立到指定服务器的TCP连接
+     */
+    private function openSocket(array $server): void
+    {
+        $this->client = new Client(SWOOLE_SOCK_TCP);
+        $this->client->set([
+            'open_length_check' => true,
+            'package_length_type' => 'N',
+            'package_length_offset' => 0,
+            'package_body_offset' => 4,
+            'package_max_length' => 1024 * 1024,
+        ]);
+        
+        if (!$this->client->connect($server['host'], $server['port'], $this->operationTimeout / 1000)) {
+            throw new ConnectionLossException("Failed to connect to {$server['host']}:{$server['port']}");
+        }
+    }
+    
+    /**
      * 发送连接请求
      */
     private function sendConnectRequest(): void
     {
         $request = new ConnectRequest(
             protocolVersion: 0,
-            lastZxidSeen: 0,
+            lastZxidSeen: $this->lastZxid,
             timeout: $this->sessionTimeout,
             sessionId: $this->sessionId,
             password: $this->sessionPassword ?: null,
@@ -172,7 +203,7 @@ class Connection
         $this->client->send($data);
         
         // 等待连接响应
-        $response = $this->client->recv($this->timeout / 1000);
+        $response = $this->client->recv($this->operationTimeout / 1000);
         if ($response === false || $response === '') {
             throw new ConnectionLossException('Failed to receive connect response');
         }
@@ -198,18 +229,26 @@ class Connection
     {
         $this->running = true;
         
-        $this->recvCoroutineId = Coroutine::create(function () {
-            while ($this->running && $this->client && $this->client->connected) {
-                $data = $this->client->recv(1.0);
+        // 绑定本协程对应的连接代次与client实例，重连后旧协程会自动退出
+        $gen = ++$this->generation;
+        $client = $this->client;
+        
+        $this->recvCoroutineId = Coroutine::create(function () use ($gen, $client) {
+            while ($this->running && $this->generation === $gen) {
+                $data = $client->recv(1.0);
+                
+                // 已被新的连接代次取代，直接退出，避免对同一socket并发recv
+                if ($this->generation !== $gen) {
+                    break;
+                }
                 
                 if ($data === false) {
-                    $errCode = $this->client->errCode;
-                    // 110 = ETIMEDOUT, -2 = SWOOLE_ERROR_SOCKET_POLL_TIMEOUT
-                    if ($errCode !== 110 && $errCode !== -2) {
-                        $this->handleDisconnect();
-                        break;
+                    // 仅当确实是读超时才继续等待，其余错误一律按断线处理
+                    if ($this->isTimeoutErrCode($client->errCode)) {
+                        continue;
                     }
-                    continue;
+                    $this->handleDisconnect();
+                    break;
                 }
                 
                 if ($data === '') {
@@ -223,10 +262,35 @@ class Connection
     }
     
     /**
+     * 判断recv返回的错误码是否为读超时（健康连接的正常空闲）
+     */
+    private function isTimeoutErrCode(int $errCode): bool
+    {
+        static $codes = null;
+        if ($codes === null) {
+            // 110 = ETIMEDOUT(Linux), -2 = SWOOLE_ERROR_SOCKET_POLL_TIMEOUT(旧版)
+            $codes = [110, -2];
+            if (defined('SWOOLE_ERROR_CO_TIMEOUT')) {
+                $codes[] = SWOOLE_ERROR_CO_TIMEOUT;
+            }
+            if (defined('SOCKET_ETIMEDOUT')) {
+                $codes[] = SOCKET_ETIMEDOUT;
+            }
+        }
+        return in_array($errCode, $codes, true);
+    }
+    
+    /**
      * 启动心跳协程
      */
     private function startPingCoroutine(): void
     {
+        // 重连时可能存在仍在sleep的旧心跳协程，先取消避免重复
+        if ($this->pingCoroutineId !== null) {
+            Coroutine::cancel($this->pingCoroutineId);
+            $this->pingCoroutineId = null;
+        }
+        
         $pingInterval = $this->negotiatedTimeout / 3000; // 转换为秒，除以3
         if ($pingInterval < 1) {
             $pingInterval = 1;
@@ -257,7 +321,7 @@ class Connection
         }
         
         $request = new PingRequest();
-        $data = $request->pack(-2); // xid = -2 表示ping
+        $data = $request->pack(self::PING_XID); // xid = -2 表示ping
         $this->client->send($data);
     }
     
@@ -269,19 +333,29 @@ class Connection
         $buffer = new Buffer($data);
         $header = ReplyHeader::parse($buffer);
         
+        // 跟踪已见的最大zxid，用于重连握手与SET_WATCHES重放
+        if ($header->zxid > 0) {
+            $this->lastZxid = $header->zxid;
+        }
+        
         // 处理Watcher通知
-        if ($header->xid === -1) {
+        if ($header->xid === self::NOTIFICATION_XID) {
             $event = WatcherEvent::parse($buffer);
             $this->handleWatcherEvent($event);
             return;
         }
         
         // 处理Ping响应
-        if ($header->xid === -2) {
+        if ($header->xid === self::PING_XID) {
             return;
         }
         
-        // 处理普通响应
+        // 处理SET_WATCHES重放响应（无需业务处理）
+        if ($header->xid === self::SET_WATCHES_XID) {
+            return;
+        }
+        
+        // 处理普通响应（含认证响应xid=-4）
         if (isset($this->pendingRequests[$header->xid])) {
             $channel = $this->pendingRequests[$header->xid]['channel'];
             unset($this->pendingRequests[$header->xid]);
@@ -364,16 +438,168 @@ class Connection
     
     /**
      * 处理断开连接
+     *
+     * 不再直接放弃会话，而是进入重连流程：在会话超时时间内尝试用同一个
+     * sessionId/password 重连到任意服务器，成功后通过 SET_WATCHES 重放watch。
      */
     private function handleDisconnect(): void
     {
-        $this->state = State::NOT_CONNECTED;
-        $this->running = false;
+        // 已主动关闭、已在重连中则忽略
+        if (!$this->running || $this->state === State::CLOSED || $this->reconnecting) {
+            return;
+        }
         
-        // 唤醒所有等待的请求
+        $this->state = State::CONNECTING;
+        
+        // 在途请求按ConnectionLoss失败，由调用方自行重试；watch保留以便重放
+        $this->failPendingRequests(new ConnectionLossException('Connection lost'));
+        
+        // 通知默认watcher连接断开（会话事件）
+        $this->notifyStateEvent(State::CONNECTING);
+        
+        $this->startReconnect();
+    }
+    
+    /**
+     * 启动重连协程
+     */
+    private function startReconnect(): void
+    {
+        if ($this->reconnecting) {
+            return;
+        }
+        $this->reconnecting = true;
+        
+        $this->reconnectCoroutineId = Coroutine::create(function () {
+            try {
+                $this->reconnectLoop();
+            } finally {
+                $this->reconnecting = false;
+                $this->reconnectCoroutineId = null;
+            }
+        });
+    }
+    
+    /**
+     * 重连主循环：在会话超时时间内不断尝试重连
+     */
+    private function reconnectLoop(): void
+    {
+        $sessionTimeoutMs = $this->negotiatedTimeout ?: $this->sessionTimeout;
+        $deadline = microtime(true) + ($sessionTimeoutMs / 1000);
+        
+        while ($this->running && microtime(true) < $deadline) {
+            // 清理旧socket
+            if ($this->client) {
+                $this->client->close();
+                $this->client = null;
+            }
+            
+            $server = $this->getNextServer();
+            
+            try {
+                $this->openSocket($server);
+                // 复用现有 sessionId / password 续接会话
+                $this->sendConnectRequest();
+                
+                // 重连成功：启动新的接收/心跳协程并重放watch
+                $this->startRecvCoroutine();
+                $this->startPingCoroutine();
+                $this->replayWatches();
+                
+                $this->notifyStateEvent(State::CONNECTED);
+                return;
+            } catch (SessionExpiredException $e) {
+                // 服务端明确返回会话已过期
+                $this->expireSession();
+                return;
+            } catch (\Throwable $e) {
+                if ($this->client) {
+                    $this->client->close();
+                    $this->client = null;
+                }
+                // 短暂退避后换下一个服务器重试
+                Coroutine::sleep(1);
+            }
+        }
+        
+        // 超过会话超时仍未连上，判定会话过期
+        if ($this->running) {
+            $this->expireSession();
+        }
+    }
+    
+    /**
+     * 标记会话过期并清理
+     */
+    private function expireSession(): void
+    {
+        $this->state = State::EXPIRED_SESSION;
+        $this->sessionId = 0;
+        $this->sessionPassword = '';
+        $this->lastZxid = 0;
+        
+        if ($this->client) {
+            $this->client->close();
+            $this->client = null;
+        }
+        
+        $this->failPendingRequests(new SessionExpiredException('Session expired'));
+        $this->notifyStateEvent(State::EXPIRED_SESSION);
+    }
+    
+    /**
+     * 重连成功后重放本地仍有效的watch
+     */
+    private function replayWatches(): void
+    {
+        $dataPaths = array_keys($this->dataWatchers);
+        $existsPaths = array_keys($this->existsWatchers);
+        $childPaths = array_keys($this->childWatchers);
+        
+        if (empty($dataPaths) && empty($existsPaths) && empty($childPaths)) {
+            return;
+        }
+        
+        $request = new SetWatchesRequest(
+            $this->lastZxid,
+            $dataPaths,
+            $existsPaths,
+            $childPaths
+        );
+        $data = $request->pack(self::SET_WATCHES_XID);
+        
+        if ($this->client && $this->client->connected) {
+            $this->client->send($data);
+        }
+    }
+    
+    /**
+     * 触发默认watcher的会话状态事件
+     */
+    private function notifyStateEvent(int $state): void
+    {
+        if ($this->defaultWatcher === null) {
+            return;
+        }
+        $cb = $this->defaultWatcher;
+        Coroutine::create(function () use ($cb, $state) {
+            try {
+                $cb(self::NOTIFICATION_XID, $state, '');
+            } catch (\Throwable $e) {
+                // 忽略watcher错误
+            }
+        });
+    }
+    
+    /**
+     * 让所有在途请求以指定错误失败
+     */
+    private function failPendingRequests(\Throwable $error): void
+    {
         foreach ($this->pendingRequests as $xid => $request) {
             $request['channel']->push([
-                'error' => new ConnectionLossException('Connection lost'),
+                'error' => $error,
             ]);
         }
         $this->pendingRequests = [];
@@ -408,7 +634,7 @@ class Connection
         }
         
         // 等待响应
-        $result = $channel->pop($this->timeout / 1000);
+        $result = $channel->pop($this->operationTimeout / 1000);
         
         if ($result === false) {
             unset($this->pendingRequests[$xid]);
@@ -477,6 +703,13 @@ class Connection
     public function close(): void
     {
         $this->running = false;
+        $this->reconnecting = false;
+        
+        // 取消重连协程（如果正在重连中）
+        if ($this->reconnectCoroutineId !== null) {
+            Coroutine::cancel($this->reconnectCoroutineId);
+            $this->reconnectCoroutineId = null;
+        }
         
         // 取消心跳协程（如果正在 sleep 中）
         if ($this->pingCoroutineId !== null) {
@@ -507,13 +740,11 @@ class Connection
         
         $this->state = State::CLOSED;
         
-        // 清理待处理的请求
-        foreach ($this->pendingRequests as $xid => $request) {
-            $request['channel']->push([
-                'error' => new ConnectionLossException('Connection closed'),
-            ]);
-        }
-        $this->pendingRequests = [];
+        // 清理待处理的请求与本地watch
+        $this->failPendingRequests(new ConnectionLossException('Connection closed'));
+        $this->dataWatchers = [];
+        $this->existsWatchers = [];
+        $this->childWatchers = [];
     }
     
     /**
@@ -541,11 +772,29 @@ class Connection
     }
     
     /**
-     * 获取超时时间
+     * 获取会话超时时间(毫秒)
+     *
+     * 已连接时返回与服务端协商后的值，否则返回请求值。
      */
     public function getTimeout(): int
     {
         return $this->negotiatedTimeout ?: $this->sessionTimeout;
+    }
+    
+    /**
+     * 获取操作超时时间(毫秒)
+     */
+    public function getOperationTimeout(): int
+    {
+        return $this->operationTimeout;
+    }
+    
+    /**
+     * 设置操作超时时间(毫秒)
+     */
+    public function setOperationTimeout(int $milliseconds): void
+    {
+        $this->operationTimeout = $milliseconds;
     }
     
     /**
