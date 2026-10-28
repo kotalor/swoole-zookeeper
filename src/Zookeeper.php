@@ -31,6 +31,7 @@ use Swoole\Zookeeper\Protocol\Response\GetAclResponse;
 use Swoole\Zookeeper\Protocol\Response\SetAclResponse;
 use Swoole\Zookeeper\Protocol\Response\Stat;
 use Swoole\Zookeeper\Exception\ZookeeperException;
+use Swoole\Zookeeper\Exception\ConnectionLossException;
 
 /**
  * Zookeeper客户端
@@ -672,13 +673,15 @@ class Zookeeper
     }
     
     /**
-     * 确保已连接
+     * 确保已连接；重连窗口内等待恢复，会话过期抛 SessionExpiredException
      */
     private function ensureConnected(): void
     {
-        if ($this->connection === null || !$this->connection->isConnected()) {
-            throw new ZookeeperException('Not connected to Zookeeper', ErrorCode::CONNECTION_LOSS);
+        if ($this->connection === null) {
+            throw new ConnectionLossException('Not connected to Zookeeper', ErrorCode::CONNECTION_LOSS);
         }
+
+        $this->connection->ensureReadyForRequest();
     }
     
     /**
